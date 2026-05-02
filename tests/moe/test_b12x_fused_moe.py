@@ -604,6 +604,76 @@ class TestB12xFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("num_tokens", [128, 512])
+    @pytest.mark.parametrize("top_k", [2, 8])
+    def test_single_stage_pipeline_accuracy(self, num_tokens: int, top_k: int):
+        """Accuracy test targeting ab_stage==1 with k_tile_cnt>1.
+
+        hidden_size=384 gives k_tile_cnt = 384 // 128 = 3 (odd), which forces
+        ab_stage from 2 down to 1 via the divisibility constraint in
+        _setup_attributes. With k_tile_cnt=3 > 1 and ab_stage=1, the up pass
+        skips reloading A/SFA into sA. This test verifies that the up GEMM
+        still produces correct results under those conditions.
+        """
+        from flashinfer import b12x_fused_moe
+
+        # hidden_size=384 → k_tile_cnt=3 (odd) → ab_stage forced to 1
+        # intermediate_size=768 keeps the tensor sizes reasonable
+        hidden_size = 384
+        intermediate_size = 768
+        num_experts = 64
+        num_local_experts = num_experts
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_local_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ab_stage=1 k_tile_cnt=3: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens}, top_k={top_k})"
+        )
+
 
 # =============================================================================
 # Test Class: Wrapper API (B12xMoEWrapper)
