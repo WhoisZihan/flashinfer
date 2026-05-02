@@ -604,8 +604,14 @@ class TestB12xFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    @pytest.mark.parametrize("num_tokens", [128, 512])
-    @pytest.mark.parametrize("top_k", [2, 8])
+    @pytest.mark.parametrize(
+        "num_tokens,top_k",
+        [
+            (64, 2),   # routed_rows=128, static kernel
+            (64, 8),   # routed_rows=512, static kernel
+            (128, 4),  # routed_rows=512, static kernel
+        ],
+    )
     def test_single_stage_pipeline_accuracy(self, num_tokens: int, top_k: int):
         """Accuracy test targeting ab_stage==1 with k_tile_cnt>1.
 
@@ -614,6 +620,10 @@ class TestB12xFunctional:
         _setup_attributes. With k_tile_cnt=3 > 1 and ab_stage=1, the up pass
         skips reloading A/SFA into sA. This test verifies that the up GEMM
         still produces correct results under those conditions.
+
+        All cases use routed_rows <= 640 to stay on the static kernel path
+        (routed_rows > 640 routes to the dynamic kernel which has different
+        hidden_size alignment requirements).
         """
         from flashinfer import b12x_fused_moe
 
