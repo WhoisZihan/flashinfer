@@ -109,6 +109,8 @@ from flashinfer.cute_dsl.fp4_common import (
     atomic_add_global_i32,
     fabs_f32,
     fmax_f32,
+    ld_shared_f32,
+    ld_shared_i32_relaxed,
     rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
@@ -118,7 +120,7 @@ from flashinfer.cute_dsl.fp4_common import (
     shared_ptr_to_u32,
     st_shared_u8,
     st_global_u64,
-    scatter_add_bf16x2,
+    scatter_add_v4_bf16x2,
 )
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
@@ -818,7 +820,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class StorageGated:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 2]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 3]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[
@@ -861,7 +863,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class StorageRelu2:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 2]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 3]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
@@ -967,22 +969,18 @@ class MoEStaticKernel:
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
-        num_global_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
-        # Phase 0: cooperative init — zero row_counts and scatter_output
+        # Phase 0: cooperative init — zero row_counts and scatter_output.
+        # global_to_local_expert, weight_expert_ids, and active_expert_count
+        # are pre-filled by the host-side compact pre-pass; no kernel-side init
+        # needed for those tables.
         i = flat_tid
         while i < num_experts:
             row_counts[i] = Int32(0)
             i += flat_stride
-        i = flat_tid
-        while i < num_global_experts:
-            global_to_local_expert[i] = Int32(-1)
-            i += flat_stride
-        if flat_tid == Int32(0):
-            active_expert_count[Int32(0)] = Int32(0)
         scatter_total = num_tokens * cols
         j = flat_tid
         while j < scatter_total:
@@ -996,42 +994,18 @@ class MoEStaticKernel:
             is_cta_leader,
         )
 
+        # Phase 1: route pairs using pre-compacted local ids from the host
+        # compact pre-pass.  topk_ids already holds compact local expert ids
+        # (0..active_expert_count-1); global_to_local_expert and
+        # weight_expert_ids are already consistent.  No CAS or spin needed.
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
-            expert_id = topk_ids[pair_idx].to(Int32)
+            local_expert_id = topk_ids[pair_idx].to(Int32)
+            expert_id = weight_expert_ids[local_expert_id].to(Int32)
             token_idx = pair_idx // num_topk
             weight = topk_weights[pair_idx].to(cutlass.Float32)
-            local_expert_id = Int32(0)
             row = Int32(0)
             if is_cta_leader > Int32(0):
-                prior_local_expert_id = _atomic_cas_global_i32(
-                    get_ptr_as_int64(global_to_local_expert, expert_id),
-                    Int32(-1),
-                    Int32(-2),
-                )
-                if prior_local_expert_id == Int32(-1):
-                    local_expert_id = atomic_add_global_i32(
-                        get_ptr_as_int64(active_expert_count, Int32(0)),
-                        Int32(1),
-                    )
-                    weight_expert_ids[local_expert_id] = expert_id
-                    _st_global_release_i32(
-                        get_ptr_as_int64(global_to_local_expert, expert_id),
-                        local_expert_id,
-                    )
-                else:
-                    if prior_local_expert_id == Int32(-2):
-                        # TODO: revisit whether we can replace this with a
-                        # weaker ordering path once the compact publish
-                        # sequence is better characterized.
-                        _spin_wait_global_eq_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                            Int32(-2),
-                        )
-                        prior_local_expert_id = _ld_global_acquire_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                        )
-                    local_expert_id = prior_local_expert_id
                 row = atomic_add_global_i32(
                     get_ptr_as_int64(row_counts, local_expert_id),
                     Int32(1),
@@ -1041,9 +1015,11 @@ class MoEStaticKernel:
                 st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
                 _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
                 _st_shared_i32(ctrl_base_addr + Int32(4), row)
+                _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
             cute.arch.sync_threads()
             local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
             row = _ld_shared_i32(ctrl_base_addr + Int32(4))
+            expert_id = _ld_shared_i32(ctrl_base_addr + Int32(8))
 
             # Distribute quantization across ALL CTA threads, not just leader.
             # Each FP4 block (16 elements) is independent — perfect parallelism.
@@ -2040,50 +2016,58 @@ class MoEStaticKernel:
                         if warp_epi_rows < Int32(0):
                             warp_epi_rows = Int32(0)
 
-                        pair_idx = lane_id
-                        while pair_idx < warp_epi_rows * Int32(32):
-                            local_row = pair_idx >> Int32(5)  # / 32
-                            local_pair_col = pair_idx & Int32(31)  # % 32
-                            global_col = (
-                                tile_n_base_cur
-                                + warp_n_base
-                                + local_pair_col * Int32(2)
-                            )
+                        tile_vec_cols = Int32(64) // Int32(8)
+                        vec_idx = lane_id
+                        while vec_idx < warp_epi_rows * tile_vec_cols:
+                            local_row = vec_idx // tile_vec_cols
+                            local_vec_col = vec_idx - local_row * tile_vec_cols
+                            local_col = warp_n_base + local_vec_col * Int32(8)
+                            global_col = tile_n_base_cur + local_col
                             cached_row = rows_offset + warp_m_base + local_row
-                            # Only lane 0 loads tok/wv from gmem; broadcast via shuffle.
-                            tok = Int32(0)
-                            wv = cutlass.Float32(0.0)
-                            if lane_id == Int32(0):
-                                tok = _ld_shared_i32(
-                                    scatter_tok_base_addr + cached_row * Int32(4)
-                                )
-                                wv = _ld_shared_f32(
-                                    scatter_weight_base_addr + cached_row * Int32(4)
-                                )
-                            tok = cute.arch.shuffle_sync(tok, Int32(0))
-                            wv = cute.arch.shuffle_sync(wv, Int32(0))
+                            tok = ld_shared_i32_relaxed(
+                                scatter_tok_base_addr + cached_row * Int32(4)
+                            )
+                            wv = ld_shared_f32(
+                                scatter_weight_base_addr + cached_row * Int32(4)
+                            )
                             sc_v0 = cutlass.Float32(
-                                sC[
-                                    warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2),
-                                    epi_buffer,
-                                ]
+                                sC[warp_m_base + local_row, local_col, epi_buffer]
                             )
                             sc_v1 = cutlass.Float32(
-                                sC[
-                                    warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2) + Int32(1),
-                                    epi_buffer,
-                                ]
+                                sC[warp_m_base + local_row, local_col + Int32(1), epi_buffer]
                             )
-                            scatter_add_bf16x2(
+                            sc_v2 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(2), epi_buffer]
+                            )
+                            sc_v3 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(3), epi_buffer]
+                            )
+                            sc_v4 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(4), epi_buffer]
+                            )
+                            sc_v5 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(5), epi_buffer]
+                            )
+                            sc_v6 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(6), epi_buffer]
+                            )
+                            sc_v7 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(7), epi_buffer]
+                            )
+                            scatter_add_v4_bf16x2(
                                 get_ptr_as_int64(
                                     scatter_output, tok * scatter_N + global_col
                                 ),
                                 wv * sc_v0,
                                 wv * sc_v1,
+                                wv * sc_v2,
+                                wv * sc_v3,
+                                wv * sc_v4,
+                                wv * sc_v5,
+                                wv * sc_v6,
+                                wv * sc_v7,
                             )
-                            pair_idx += Int32(self.num_threads_per_warp)
+                            vec_idx += Int32(self.num_threads_per_warp)
 
                         # Post-scatter barrier: needed to ensure all warps
                         # finish scatter before next output tile's pipeline ops

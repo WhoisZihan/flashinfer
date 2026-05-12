@@ -1432,7 +1432,20 @@ def launch_sm120_static_moe(
             activation=activation,
             activation_precision=activation_precision,
         )
-        launch_ids = flat_ids
+        # Run O(N+E) compact pre-pass: builds global_to_local_expert,
+        # weight_expert_ids, active_expert_count, and compact_topk_ids so
+        # the static kernel no longer needs CAS + spin for routing.
+        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+        from .triton_compact import compact_topk_ids_with_g2l as _compact_with_g2l
+
+        _compact_with_g2l(
+            flat_ids,
+            compact_ids,
+            workspace.weight_expert_ids,
+            workspace.global_to_local_expert,
+            workspace.active_expert_count,
+        )
+        launch_ids = compact_ids
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
     runtime_args: Tuple[Any, ...] = (
