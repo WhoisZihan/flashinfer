@@ -250,6 +250,18 @@ def parse_moe_args(line, parser):
             "eliminates per-call allocation overhead."
         ),
     )
+    parser.add_argument(
+        "--activation_precision",
+        type=str,
+        default="fp4",
+        choices=["fp4", "bf16"],
+        help=(
+            "Intermediate activation precision for b12x_fused_moe: "
+            "'fp4' (W4A4, quantize FC1 output to FP4 before FC2) or "
+            "'bf16' (W4A16, keep FC1 output in BF16 for higher accuracy). "
+            "Default: fp4"
+        ),
+    )
 
     # CUTLASS fused MoE specific
     parser.add_argument(
@@ -1634,6 +1646,7 @@ def testB12xFusedMoe(args):
     num_experts = args.num_experts
     top_k = args.top_k
     local_num_experts = args.local_num_experts or num_experts
+    activation_precision = getattr(args, "activation_precision", "fp4")
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
@@ -1646,7 +1659,8 @@ def testB12xFusedMoe(args):
     if args.verbose >= 1:
         print(
             f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
-            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}, "
+            f"activation_precision={activation_precision}"
         )
 
     # b12x supports SwiGLU (gated) and ReLU2 (non-gated)
@@ -1699,6 +1713,7 @@ def testB12xFusedMoe(args):
             num_local_experts=local_num_experts,
             output=moe_output,
             activation=activation_str,
+            activation_precision=activation_precision,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1724,6 +1739,7 @@ def testB12xFusedMoe(args):
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
             activation=activation_str,
+            activation_precision=activation_precision,
         )
         runner = moe.run
 
@@ -1849,6 +1865,7 @@ def testB12xFusedMoe(args):
         cur_res["weight_dtype"] = weight_dtype
         cur_res["fp4_mode"] = "nvfp4"
         cur_res["activation_type"] = activation_type.name
+        cur_res["activation_precision"] = activation_precision
         res.append(cur_res)
 
     return res

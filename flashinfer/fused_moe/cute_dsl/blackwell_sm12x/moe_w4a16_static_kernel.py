@@ -54,7 +54,6 @@ from cutlass.cute.nvgpu import cpasync
 
 from flashinfer.cute_dsl.fp4_common import (
     atomic_add_global_i32,
-    atomic_cas_global_i32,
     cvt_e4m3_to_f32_via_f16,
     f16x2_to_f32x2,
     fmax_f32,
@@ -838,22 +837,18 @@ class MoEStaticKernel(_MoEStaticKernelBase):
         max_rows = Int32(token_map.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
-        num_global_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
 
-        # Phase 0: cooperative init — zero row_counts and scatter_output
+        # Phase 0: cooperative init — zero row_counts and scatter_output.
+        # global_to_local_expert, weight_expert_ids, and active_expert_count
+        # are pre-filled by the host-side compact pre-pass; no kernel-side init
+        # needed for those tables.
         if cutlass.const_expr(not self.single_token):
             i = flat_tid
             while i < num_experts:
                 row_counts[i] = Int32(0)
                 i += flat_stride
-            i = flat_tid
-            while i < num_global_experts:
-                global_to_local_expert[i] = Int32(-1)
-                i += flat_stride
-            if flat_tid == Int32(0):
-                active_expert_count[Int32(0)] = Int32(0)
         if cutlass.const_expr(self.single_token):
             num_active_experts = total_pairs
         else:
@@ -872,47 +867,24 @@ class MoEStaticKernel(_MoEStaticKernelBase):
                 is_cta_leader,
             )
 
+        # Phase 1: route pairs using pre-compacted local ids from the host
+        # compact pre-pass.  topk_ids already holds compact local expert ids
+        # (0..active_expert_count-1); global_to_local_expert and
+        # weight_expert_ids are already consistent.  No CAS or spin needed.
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
             token_idx = Int32(0)
             weight = cutlass.Float32(0.0)
-            if cutlass.const_expr(not self.single_token):
-                expert_id = topk_ids[pair_idx].to(Int32)
-                token_idx = pair_idx // num_topk
-                weight = topk_weights[pair_idx].to(cutlass.Float32)
-
             local_expert_id = Int32(0)
             row = Int32(0)
             if cutlass.const_expr(self.single_token):
                 local_expert_id = pair_idx
                 expert_id = topk_ids[local_expert_id].to(Int32)
             else:
+                local_expert_id = topk_ids[pair_idx].to(Int32)
+                token_idx = pair_idx // num_topk
+                weight = topk_weights[pair_idx].to(cutlass.Float32)
                 if is_cta_leader > Int32(0):
-                    prior_local_expert_id = atomic_cas_global_i32(
-                        get_ptr_as_int64(global_to_local_expert, expert_id),
-                        Int32(-1),
-                        Int32(-2),
-                    )
-                    if prior_local_expert_id == Int32(-1):
-                        local_expert_id = atomic_add_global_i32(
-                            get_ptr_as_int64(active_expert_count, Int32(0)),
-                            Int32(1),
-                        )
-                        weight_expert_ids[local_expert_id] = expert_id
-                        st_global_release_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                            local_expert_id,
-                        )
-                    else:
-                        if prior_local_expert_id == Int32(-2):
-                            spin_wait_global_eq_i32(
-                                get_ptr_as_int64(global_to_local_expert, expert_id),
-                                Int32(-2),
-                            )
-                            prior_local_expert_id = ld_global_acquire_i32(
-                                get_ptr_as_int64(global_to_local_expert, expert_id),
-                            )
-                        local_expert_id = prior_local_expert_id
                     row = atomic_add_global_i32(
                         get_ptr_as_int64(row_counts, local_expert_id),
                         Int32(1),
